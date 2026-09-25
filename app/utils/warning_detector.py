@@ -85,17 +85,21 @@ def detect_continuous_decline(
     declines = []
     current_start = 0
     current_decline_count = 0
-    current_sequence = []
 
     for i in range(1, len(yearly_data)):
-        prev_val = yearly_data[i - 1][indicator]
-        curr_val = yearly_data[i][indicator]
+        prev_point = yearly_data[i - 1]
+        curr_point = yearly_data[i]
 
-        if curr_val < prev_val:
+        # 只有年份相邻（相差一届）且指标严格低于上一届，才属于同一段连续下降。
+        # 年份不连续（中间缺届）或数值持平/上升都会截断当前序列，
+        # 后续若重新下降则另起一段。
+        is_consecutive_year = curr_point["year"] == prev_point["year"] + 1
+        is_decline = curr_point[indicator] < prev_point[indicator]
+
+        if is_consecutive_year and is_decline:
             if current_decline_count == 0:
                 current_start = i - 1
             current_decline_count += 1
-            current_sequence.append(yearly_data[i])
         else:
             if current_decline_count >= DECLINE_THRESHOLD_YELLOW:
                 declines.append((
@@ -105,7 +109,6 @@ def detect_continuous_decline(
                     yearly_data[current_start:i],
                 ))
             current_decline_count = 0
-            current_sequence = []
 
     if current_decline_count >= DECLINE_THRESHOLD_YELLOW:
         declines.append((
@@ -179,13 +182,16 @@ def check_existing_warning(
     indicator: str,
     start_year: int,
     end_year: int,
+    statuses: Optional[List[WarningStatus]] = None,
 ) -> Optional[Warning]:
+    if statuses is None:
+        statuses = [WarningStatus.ACTIVE]
     return db.query(Warning).filter(
         Warning.target_type == target_type,
         Warning.target_id == target_id,
         Warning.warning_type == warning_type,
         Warning.indicator == indicator,
-        Warning.status == WarningStatus.ACTIVE,
+        Warning.status.in_(statuses),
         Warning.start_year <= start_year,
         Warning.end_year >= end_year,
     ).first()
@@ -206,11 +212,12 @@ def create_warning(
     province_value: Optional[float] = None,
     gap: Optional[float] = None,
     description: Optional[str] = None,
-) -> Warning:
+) -> Optional[Warning]:
     existing = check_existing_warning(
         db, target_type, target_id, warning_type, indicator, start_year, end_year
     )
     if existing:
+        # 同一真实区间重新检测到：更新既有活动预警，不重复生成
         existing.current_value = current_value
         existing.end_year = end_year
         existing.decline_count = decline_count
@@ -221,6 +228,14 @@ def create_warning(
         existing.description = description
         db.flush()
         return existing
+
+    closed = check_existing_warning(
+        db, target_type, target_id, warning_type, indicator, start_year, end_year,
+        statuses=[WarningStatus.RESOLVED, WarningStatus.DISMISSED],
+    )
+    if closed:
+        # 同一真实区间的预警已被人工关闭，不无条件重新激活
+        return None
 
     target_name = get_target_name(db, target_type, target_id)
 
@@ -285,7 +300,8 @@ def run_warning_detection_for_target(
                 decline_details=sequence,
                 description=description,
             )
-            created_warnings.append(warning)
+            if warning is not None:
+                created_warnings.append(warning)
 
     for indicator, label in [
         ("confirmed_rate", "去向落实率"),
@@ -316,31 +332,42 @@ def run_warning_detection_for_target(
                 existing.gap = gap
                 existing.description = description
                 created_warnings.append(existing)
-            else:
-                target_name = get_target_name(db, target_type, target_id)
-                warning = Warning(
-                    warning_type=WarningType.BELOW_PROVINCE_LINE,
-                    warning_level=level,
-                    status=WarningStatus.ACTIVE,
-                    target_type=target_type,
-                    target_id=target_id,
-                    target_name=target_name,
-                    indicator=indicator,
-                    current_value=current_value,
-                    province_value=threshold,
-                    gap=gap,
-                    start_year=year,
-                    end_year=year,
-                    decline_count=1,
-                    decline_details=json.dumps([
-                        d for d in yearly_data if d["year"] == year
-                    ], ensure_ascii=False),
-                    description=description,
-                )
-                db.add(warning)
-                db.flush()
-                created_warnings.append(warning)
+                continue
 
+            closed = check_existing_warning(
+                db, target_type, target_id, WarningType.BELOW_PROVINCE_LINE,
+                indicator, year, year,
+                statuses=[WarningStatus.RESOLVED, WarningStatus.DISMISSED],
+            )
+            if closed:
+                # 同一届次的预警已被人工关闭，不无条件重新激活
+                continue
+
+            target_name = get_target_name(db, target_type, target_id)
+            warning = Warning(
+                warning_type=WarningType.BELOW_PROVINCE_LINE,
+                warning_level=level,
+                status=WarningStatus.ACTIVE,
+                target_type=target_type,
+                target_id=target_id,
+                target_name=target_name,
+                indicator=indicator,
+                current_value=current_value,
+                province_value=threshold,
+                gap=gap,
+                start_year=year,
+                end_year=year,
+                decline_count=1,
+                decline_details=json.dumps([
+                    d for d in yearly_data if d["year"] == year
+                ], ensure_ascii=False),
+                description=description,
+            )
+            db.add(warning)
+            db.flush()
+            created_warnings.append(warning)
+
+    db.commit()
     return created_warnings
 
 
