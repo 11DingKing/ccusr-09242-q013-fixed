@@ -117,6 +117,7 @@ def run_detection(
 ):
     if target_type and target_id:
         warnings = run_warning_detection_for_target(db, target_type, target_id)
+        db.commit()
         return {
             "message": f"针对{target_type}#{target_id}的预警检测完成",
             "warnings_count": len(warnings),
